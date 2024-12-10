@@ -24,7 +24,7 @@
 (defconst emacs-built-in-themes (cons 'default (custom-available-themes))
   "List of emacs built-in themes")
 
-(defvar spacemacs--fallback-theme 'spacemacs-dark
+(defvar spacemacs--fallback-theme nil
   "Fallback theme if user theme cannot be applied.")
 
 (defvar spacemacs--delayed-user-theme nil
@@ -39,6 +39,8 @@
   "Face for displaying key bindings in Spacemacs documents."
   :group 'org-faces)
 
+;; Do NOT inflate this map, encourage users to use '(<theme> :package <pkg-name>)
+;; in `dotspacemacs-themes'.
 (defconst spacemacs-theme-name-to-package
   '(
     (alect-black                      . alect-themes)
@@ -341,16 +343,20 @@ package name does not match theme name + `-theme' suffix.")
 (defvar spacemacs-post-theme-change-hook nil
   "Hook run after theme has changed.")
 
-(defun spacemacs/get-theme-package-name (theme-name)
+(defun spacemacs/get-theme-package-name (theme)
   "Returns the package theme for the given THEME name."
-  (cond
-   ;; built-in
-   ((memq theme-name emacs-built-in-themes) nil)
-   ;; from explicit alist
-   ((assq theme-name spacemacs-theme-name-to-package)
-    (cdr (assq theme-name spacemacs-theme-name-to-package)))
-   ;; fallback to <name>-theme
-   (t (intern (format "%S-theme" theme-name)))))
+  (if-let* (((listp theme))
+            (pkg-name (plist-get (cdr theme) :package)))
+      pkg-name
+    (let ((theme-name (or (car-safe theme) theme)))
+      (cond
+       ;; built-in
+       ((memq theme-name emacs-built-in-themes) nil)
+       ;; from explicit alist
+       ((assq theme-name spacemacs-theme-name-to-package)
+        (cdr (assq theme-name spacemacs-theme-name-to-package)))
+       ;; fallback to <name>-theme
+       (t (intern (format "%S-theme" theme-name)))))))
 
 (defun spacemacs//get-theme-name (theme)
   "Return the name of THEME."
@@ -360,8 +366,7 @@ package name does not match theme name + `-theme' suffix.")
 
 (defun spacemacs//get-theme-package-directory (theme)
   "Return the THEME location on disk."
-  (let* ((theme-name (spacemacs//get-theme-name theme))
-         (pkg-name (spacemacs/get-theme-package-name theme-name))
+  (let* ((pkg-name (spacemacs/get-theme-package-name theme))
          (dir (when (listp theme)
                 (configuration-layer/get-location-directory
                  pkg-name
@@ -373,18 +378,44 @@ package name does not match theme name + `-theme' suffix.")
                  pkg-name)))
     dir))
 
+(defun spacemacs//guess-fallback-theme (theme)
+  "Guess the fallback theme for a THEME"
+  (when theme
+    (or (and (listp theme)
+             (plist-get (cdr theme) :fallback))
+        (cond ((string-match-p "light" (symbol-name theme))
+               'spacemacs-light)
+              ((string-match-p "dark" (symbol-name theme))
+               'spacemacs-dark)))))
+
 (defun spacemacs/load-default-theme ()
   "Load default theme.
-Default theme is the car of `dotspacemacs-themes'. If failed to load the
-default theme, setting the `spacemacs--delayed-user-theme' to postpond
-the action."
+Default theme is the first element of `dotspacemacs-themes'.  If
+loading the default theme fails, set
+`spacemacs--delayed-user-theme' to postpone the action and try
+again layer configuration."
   ;; This function is called before all packages are necessarily activated, so
   ;; if failed to load the theme we can try again after the packages activated.
   (if-let* ((default-theme (car dotspacemacs-themes))
             (theme-name (spacemacs//get-theme-name default-theme)))
-      (condition-case err
-          (spacemacs//load-theme-internal theme-name)
-        ('error (setq spacemacs--delayed-user-theme theme-name)))
+      (progn
+        ;; non-registered theme, assume the theme is from a package
+        (when-let* (((not (memq theme-name (cons 'default (custom-available-themes)))))
+                    (pkg-name (spacemacs/get-theme-package-name default-theme)))
+          (when dotspacemacs-enable-package-quickstart
+            (spacemacs-buffer/warning
+             (format-message "Your default theme %s requires full package initialization, negating the benefit of `dotspacemacs-enable-package-quickstart'."
+                             theme-name)))
+          (package-initialize 'no-activate)
+          (package-activate pkg-name)
+          (spacemacs//activate-theme-packages (list default-theme)))
+        (condition-case err
+            (spacemacs//load-theme-internal theme-name)
+          ('error (setq spacemacs--delayed-user-theme theme-name)
+                  (setq spacemacs--fallback-theme
+                        (or (spacemacs//guess-fallback-theme default-theme)
+                            'spacemacs-dark))
+                  (spacemacs//load-theme-internal spacemacs--fallback-theme))))
     (spacemacs-buffer/warning
      (concat "Please check the `dotspacemacs-themes' in your dotfile\n"
              "to make sure it has valid themes. Invalid value: \"%s\"")
@@ -479,8 +510,7 @@ has been changed to THEME."
   "Add all theme packages from `dotspacemacs-themes' to packages to install."
   (setq dotspacemacs--additional-theme-packages nil)
   (dolist (theme dotspacemacs-themes)
-    (let* ((theme-name (spacemacs//get-theme-name theme))
-           (pkg-name (spacemacs/get-theme-package-name theme-name))
+    (let* ((pkg-name (spacemacs/get-theme-package-name theme))
            (theme2 (copy-tree theme)))
       (when pkg-name
         (if (listp theme2)
@@ -490,16 +520,16 @@ has been changed to THEME."
 (add-hook 'configuration-layer-pre-load-hook
           'spacemacs//add-theme-packages-to-additional-packages)
 
-(defun spacemacs//activate-theme-packages ()
+(defun spacemacs//activate-theme-packages (&optional themes-list)
   "Activate all theme packages from `dotspacemacs-themes'."
   ;; Not all themes add themselves to `custom-theme-load-path' in autoloads.
   ;; (for example, moe-theme).
   ;;
   ;; Also, if a theme is :location local, autoloads do not happen,
   ;; so this is needed for those packages.
-  (dolist (theme dotspacemacs-themes)
-    (when-let* ((theme-name (spacemacs//get-theme-name theme))
-                ((memq theme-name (cons 'default (custom-available-themes))))
+  (dolist (theme (or themes-list dotspacemacs-themes))
+    (when-let* ((name (spacemacs//get-theme-name theme))
+                ((not (memq name (cons 'default (custom-available-themes)))))
                 (pkg-dir (spacemacs//get-theme-package-directory theme)))
       (add-to-list 'custom-theme-load-path pkg-dir))))
 
